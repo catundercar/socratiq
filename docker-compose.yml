@@ -1,0 +1,95 @@
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: socratiq
+      POSTGRES_PASSWORD: socratiq
+      POSTGRES_DB: socratiq
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U socratiq"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://socratiq:socratiq@db:5432/socratiq
+      - REDIS_URL=redis://redis:6379/0
+      - CODEX_HOME=/codex-home
+      # Needed to decrypt model_configs.api_key_encrypted. Supplied by
+      # env_file above; also passed through explicitly (interpolated from the
+      # host env/.env — no secret hardcoded) so the dependency is visible and
+      # survives even if env_file is dropped.
+      - LLM_ENCRYPTION_KEY=${LLM_ENCRYPTION_KEY}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - codexhome:/codex-home
+
+  worker:
+    build: ./backend
+    # ARQ worker — drains the async-task queue (ingest, course/lesson
+    # generation, exercises). The app enqueues via ARQ (app/worker/queue.py),
+    # so this MUST be the ARQ entrypoint. Celery was removed in Phase 3 and
+    # app/worker/celery_app no longer exists: a `celery …` command here crashes
+    # on startup, leaves the ARQ queue unconsumed, and every import sticks in
+    # "排队中" forever. Concurrency is set via WorkerSettings.max_jobs.
+    command: arq app.worker.arq_app.WorkerSettings
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://socratiq:socratiq@db:5432/socratiq
+      - REDIS_URL=redis://redis:6379/0
+      - CODEX_HOME=/codex-home
+      # Needed to decrypt model_configs.api_key_encrypted. Supplied by
+      # env_file above; also passed through explicitly (interpolated from the
+      # host env/.env — no secret hardcoded) so the dependency is visible and
+      # survives even if env_file is dropped.
+      - LLM_ENCRYPTION_KEY=${LLM_ENCRYPTION_KEY}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - codexhome:/codex-home
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+    environment:
+      - BACKEND_URL=http://backend:8000
+
+volumes:
+  pgdata:
+  redisdata:
+  codexhome:
